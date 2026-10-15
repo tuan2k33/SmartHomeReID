@@ -8,7 +8,6 @@ The crop pipeline (detector + pad + quality filter, vpet.md section 5.2) is a
 separate preprocessing step and is NOT implemented here — run it before using
 this script. Eval protocol (query/gallery Rank-1/mAP, section 6) lives in
 eval_utils.py / eval.py.
-
 """
 
 import csv
@@ -27,14 +26,21 @@ from transformers import AutoModel
 
 from torch.amp import autocast, GradScaler
 
-from eval_utils import evaluate_model
+from eval_utils import EvalSet, evaluate, split_val
 
 # --------------------------------------------------------------------------
 # Config (edit directly — this is a skeleton, not a CLI tool)
+# Values reproduce the earlier 0.9442-mAP run; tuning history is in git.
 # --------------------------------------------------------------------------
 DATA_ROOT = "/home/user/Documents/dataset/pet-data/DogFaceNet/dataset/train"
+DATASET_ROOT = "/home/user/Documents/dataset/pet-data/DogFaceNet/dataset"  # query/gallery test split, used only for the final eval
 BACKBONE_PATH = "/home/user/Documents/dinov3_models/dinov3-vitb16-pretrain-lvd1689m"
 IMG_SIZE = 224                       # multiple of patch size (16 here)
+
+# Validation: this fraction of the train identities is held out (seeded). For each one,
+# the first image is a query and the rest are gallery. It picks best.pt and drives early stop.
+VAL_FRACTION = 0.1
+VAL_SEED = 0
 
 # --- augmentation (sup_transform below) ---
 CROP_SCALE_MIN = 0.5                 # RandomResizedCrop lower bound (fraction of original area)
@@ -43,63 +49,40 @@ COLORJITTER_BRIGHTNESS = 0.3
 COLORJITTER_CONTRAST = 0.3
 COLORJITTER_SATURATION = 0.3
 COLORJITTER_HUE = 0.08
-GRAYSCALE_P = 0.30                   # reverted from 0.50 -- p=0.30 was tight across 2 repeats
-                                      # (0.9407, 0.9410), while p=0.50 spread much wider across 3
-                                      # repeats (0.9371, 0.9405, 0.9379) -- 30% learns the invariance
-                                      # without adding as much run-to-run variance.
-                                      # (grayscale is a reasonable proxy for IR-camera nighttime
-                                      # captures specifically, not for low-light color-camera shots)
+GRAYSCALE_P = 0.30                   # proxy for IR-camera night captures, not for low-light colour shots
 ERASING_P = 0.3
 ERASING_SCALE_MIN = 0.02
 ERASING_SCALE_MAX = 0.15
-UNFREEZE_BLOCK_INDICES = [11]        # back to block 11 -- blocks 9/10/11 have all landed in the same
-                                      # ~94.1-94.4% range (differences within run-to-run noise), so this
-                                      # switch is mainly to pair with SCHEDULER_T0=20 below.
+UNFREEZE_BLOCK_INDICES = [11]
 UNFREEZE_FINAL_NORM = False
 RETRIEVAL_DIM = 256
 
-P_IDENTITIES = 64                    # PK sampling: P identities -- reverted to reproduce the 0.9442
-                                      # record config (batch=256), only swapping block 10->11 and
-                                      # keeping eps=1e-10 this time.
-K_IMAGES = 4                         # x K images each -> sup batch = 256
+P_IDENTITIES = 64                    # PK sampling: P identities x K images each -> batch = 256
+K_IMAGES = 4
 USE_AMP = True                       # mixed precision -- roughly halves activation memory
 
-ARCFACE_MARGIN = 0.25                # reverted -- margin=0.3 topped out at 0.9347, below margin=0.25's
-                                      # 0.9442 record.
-ARCFACE_SCALE = 40.0                 # reverted, see above. History: 24->65.5x, 1->2.8x (too flat),
-                                      # 16+lambda=50->0.9x (near-perfect balance), 40+lambda=100
-                                      # (this config) produced the 0.9442 record.
+ARCFACE_MARGIN = 0.25
+ARCFACE_SCALE = 40.0
 ARCFACE_SUBCENTERS = 3
 ADAFACE_H = 0.33                     # quality-margin sensitivity
 
-LR_HEAD = 1e-3                       # reverted to the value the 0.9442 record was set with (batch=256).
-                                      # The 2e-3/3e-3/5e-3 tuning was specific to batch=512.
+LR_HEAD = 1e-3                       # tuned for batch=256
 LR_BACKBONE_MULT = 0.05              # backbone unfrozen block gets LR_HEAD * this
-ADAM_EPS = 1e-10                     # was default 1e-8
+ADAM_EPS = 1e-10
 
-LAMBDA_ARCFACE = 1.0                  # restored -- ablation phase concluded (0 for ArcFace-only, or
-                                       # LAMBDA1_TRIPLET=0 for Triplet-only, if re-running either later)
-LAMBDA1_TRIPLET = 100.0               # reverted to the value that produced the 0.9442 record.
+LAMBDA_ARCFACE = 1.0                 # set one of the two to 0 for a single-loss ablation
+LAMBDA1_TRIPLET = 100.0
 
 EPOCHS = 100
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- scheduler / early-stop / logging / checkpointing ---
-DATASET_ROOT = "/home/user/Documents/dataset/pet-data/DogFaceNet/dataset"  # for periodic eval (query/gallery)
 LR_WARMUP_EPOCHS = 5
-SCHEDULER_T0 = 20                    # was 10 -- with patience=25, T0=10 forced 3 restarts before
-                                      # early-stop (epoch 15/25/35), spending most of the patience
-                                      # budget recovering from disruption rather than converging.
-                                      # T0=20 gives one uninterrupted 20-epoch decay before the first
-                                      # restart lands right around when patience would trigger anyway.
-LR_MIN_FRACTION = 1e-7               # was 0.05 (floor at lr_head=5e-5) -- hypothesis: that floor kept
-                                      # each cycle from ever converging to a stable minimum before the
-                                      # next restart kicked LR back up, which may be why post-restart
-                                      # mAP recovery plateaus/dips instead of cleanly settling. Now
-                                      # ~1e-10 floor (per-group, off base_lr), effectively disabled.
+SCHEDULER_T0 = 20                    # first cosine cycle length; T0=10 forced 3 restarts before early stop
+LR_MIN_FRACTION = 1e-7               # per-group LR floor as a fraction of its base LR (effectively none)
 
 EVAL_EVERY_N_EPOCHS = 1
-EARLY_STOP_PATIENCE = 25             # back to the value the 0.9442 record was set with.
+EARLY_STOP_PATIENCE = 25
 
 CHECKPOINT_DIR = "checkpoints"
 LOG_CSV_PATH = "train_log.csv"
@@ -117,9 +100,9 @@ INIT_WEIGHTS_PATH = None
 class IdentityFolderDataset(Dataset):
     """dataset/train/{identity_id}/*.jpg -> (path, label_idx)."""
 
-    def __init__(self, root):
+    def __init__(self, root, identities):
         self.root = Path(root)
-        self.identities = sorted(p.name for p in self.root.iterdir() if p.is_dir())
+        self.identities = sorted(identities)
         self.label_to_idx = {name: i for i, name in enumerate(self.identities)}
         self.samples = []  # (path, label_idx)
         self.by_label = {i: [] for i in range(len(self.identities))}
@@ -283,7 +266,7 @@ class SubCenterAdaFaceArcFace(nn.Module):
             self.norm_mean.mul_(0.99).add_(raw_feat_norm.mean() * 0.01)
             self.norm_std.mul_(0.99).add_(raw_feat_norm.std() * 0.01)
         quality = (raw_feat_norm - self.norm_mean) / (self.norm_std + self.eps)
-        quality = torch.clamp(quality, -1, 1)
+        quality = torch.clamp(quality, -1, 1).detach()  # as in AdaFace: the margin must not give the model a gradient on its own feature norm
         adaptive_margin = self.margin * (1 + self.h * quality)  # per-sample margin
 
         target_cos = cos_best.gather(1, labels.view(-1, 1)).squeeze(1)
@@ -345,7 +328,7 @@ def print_config():
     # dumped at the top of every run's log so each train_run.log is self-contained --
     # no more reconstructing hyperparameters from code-comment history after the fact.
     keys = [
-        "DATA_ROOT", "DATASET_ROOT", "CHECKPOINT_DIR", "LOG_CSV_PATH",
+        "DATA_ROOT", "DATASET_ROOT", "CHECKPOINT_DIR", "LOG_CSV_PATH", "VAL_FRACTION", "VAL_SEED",
         "UNFREEZE_BLOCK_INDICES", "UNFREEZE_FINAL_NORM", "RETRIEVAL_DIM",
         "P_IDENTITIES", "K_IMAGES", "USE_AMP",
         "CROP_SCALE_MIN", "CROP_SCALE_MAX", "COLORJITTER_BRIGHTNESS", "COLORJITTER_CONTRAST",
@@ -361,8 +344,10 @@ def print_config():
 
 def train():
     print_config()
-    base_ds = IdentityFolderDataset(DATA_ROOT)
-    num_classes = len(base_ds.valid_labels)
+    train_names, val_split = split_val(DATA_ROOT, VAL_FRACTION, VAL_SEED)
+    base_ds = IdentityFolderDataset(DATA_ROOT, train_names)
+    num_classes = len(base_ds.identities)  # labels are indices into identities, so size by all of them
+    val_set = EvalSet(*val_split, IMG_SIZE)
 
     sup_ds = SupDataset(base_ds)
     iters_per_epoch = max(1, len(base_ds.samples) // (P_IDENTITIES * K_IMAGES))
@@ -384,17 +369,8 @@ def train():
     optimizer = torch.optim.AdamW(param_groups, weight_decay=0.05, eps=ADAM_EPS)
     base_lrs = [g["lr"] for g in optimizer.param_groups]  # captured pre-scheduler, for the floor clamp below
 
-    # linear warmup for LR_WARMUP_EPOCHS, then a SINGLE monotonic cosine decay
-    # back to SGDR (CosineAnnealingWarmRestarts, T_0=10): the no-restart single-
-    # decay variant was tried and actually plateaued LOWER (91.31 vs 92.02 at the
-    # same epoch), though that comparison was confounded by decay speed (SGDR's
-    # per-cycle decay is much faster than a single decay spread over 95 epochs)
-    # so it's not clean evidence against restarts specifically. Reverting to SGDR
-    # since it's still the config that produced the best result so far (94.10),
-    # now paired with a longer patience (15) to give post-restart recovery more room.
-    # eta_min stays 0 (single scalar for all groups, would collapse the
-    # discriminative ratio at the trough) -- the OWN-base-lr floor clamp after
-    # step() handles the floor per-group instead.
+    # linear warmup, then cosine decay with warm restarts (SGDR). eta_min stays 0 because it is one
+    # scalar for all groups; the per-group floor clamp after scheduler.step() handles the floor instead.
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=1 / LR_WARMUP_EPOCHS, end_factor=1.0, total_iters=LR_WARMUP_EPOCHS
     )
@@ -410,13 +386,12 @@ def train():
         "epoch", "lr_backbone", "lr_head", "loss_arc", "loss_trip", "rank1", "mAP",
     ])
 
-    # untrained baseline -- see review notes: DINOv3 pretrained features already
-    # score suspiciously high on this dataset (same-shoot/background similarity),
-    # so this number is the bar later epochs need to beat for the RIGHT reasons.
-    rank1_0, mAP_0 = evaluate_model(model, DATASET_ROOT, IMG_SIZE, DEVICE)
-    print(f"[baseline] Rank-1={rank1_0:.4f} mAP={mAP_0:.4f}")
+    # untrained baseline, for reference only: pretrained DINOv3 features can already score high on
+    # this kind of data, so compare later epochs against this number.
+    rank1_0, mAP_0 = evaluate(model, val_set, DEVICE)
+    print(f"[baseline] val Rank-1={rank1_0:.4f} mAP={mAP_0:.4f}")
 
-    best_mAP = mAP_0
+    best_mAP = -1.0  # not the baseline, so best.pt is always written by the first eval of this run
     epochs_without_improvement = 0
 
     for epoch in range(EPOCHS):
@@ -454,7 +429,7 @@ def train():
 
         rank1 = mAP = ""
         if (epoch + 1) % EVAL_EVERY_N_EPOCHS == 0 or epoch == EPOCHS - 1:
-            rank1, mAP = evaluate_model(model, DATASET_ROOT, IMG_SIZE, DEVICE)
+            rank1, mAP = evaluate(model, val_set, DEVICE)
             print(f"epoch {epoch}: loss_arc={sum_arc/n_steps:.4f} loss_trip={sum_trip/n_steps:.4f} "
                   f"Rank-1={rank1:.4f} mAP={mAP:.4f}")
 
@@ -484,14 +459,16 @@ def train():
             "rank1": rank1, "mAP": mAP,
         })
 
-    # archive this run's best checkpoint under its own mAP-named file, so it
-    # survives the next run overwriting checkpoints/best.pt -- no more manual
-    # cp best.pt best_orgN.pt before every restart.
+    # archive this run's best checkpoint under its val-mAP-named file, so the next run
+    # does not overwrite it, then report best.pt once on the held-out query/gallery test split.
     best_path = os.path.join(CHECKPOINT_DIR, "best.pt")
     if os.path.exists(best_path):
         archive_path = os.path.join(CHECKPOINT_DIR, f"{best_mAP:.4f}.pt")
         shutil.copy2(best_path, archive_path)
         print(f"[archive] copied best.pt -> {archive_path}")
+        model.load_state_dict(torch.load(best_path, map_location=DEVICE))
+        rank1, mAP = evaluate(model, EvalSet.from_dataset_root(DATASET_ROOT, IMG_SIZE), DEVICE)
+        print(f"[test] best.pt on query/gallery: Rank-1={rank1:.4f} mAP={mAP:.4f}")
 
 
 if __name__ == "__main__":
