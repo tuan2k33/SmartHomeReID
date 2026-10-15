@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-Config is edited directly in the module-level constants (no CLI, no argparse). All paths default to `/home/user/Documents/...` and must be changed first (`DATA_ROOT`, `DATASET_ROOT`, `BACKBONE_PATH` in `train_skeleton.py`, `DATASET_ROOT` and `CHECKPOINT_PATH` in `eval.py`).
+Config is edited directly in the module-level constants (no CLI, no argparse). The default paths are relative placeholders (`data/dataset/...`, `models/dinov3-vitb16-pretrain-lvd1689m`) and must be pointed at the real dataset and backbone first (`DATA_ROOT`, `DATASET_ROOT`, `BACKBONE_PATH` in `train_skeleton.py`, `DATASET_ROOT` and `CHECKPOINT_PATH` in `eval.py`).
 
 - Train: `python train_skeleton.py` (writes `checkpoints/{last,best,<mAP>}.pt` and `train_log.csv` to the cwd)
 - Test: `pytest tests/` (single test: `pytest tests/test_eval_utils.py::test_no_scorable_query_raises`); needs `torch` because `eval_utils` imports it

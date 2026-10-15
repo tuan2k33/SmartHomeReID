@@ -32,9 +32,9 @@ from eval_utils import EvalSet, evaluate, split_val
 # Config (edit directly — this is a skeleton, not a CLI tool)
 # Values reproduce the earlier 0.9442-mAP run; tuning history is in git.
 # --------------------------------------------------------------------------
-DATA_ROOT = "/home/user/Documents/dataset/pet-data/DogFaceNet/dataset/train"
-DATASET_ROOT = "/home/user/Documents/dataset/pet-data/DogFaceNet/dataset"  # query/gallery test split, used only for the final eval
-BACKBONE_PATH = "/home/user/Documents/dinov3_models/dinov3-vitb16-pretrain-lvd1689m"
+DATA_ROOT = "data/dataset/train"
+DATASET_ROOT = "data/dataset"  # query/gallery test split, used only for the final eval
+BACKBONE_PATH = "models/dinov3-vitb16-pretrain-lvd1689m"
 IMG_SIZE = 224                       # multiple of patch size (16 here)
 
 # Validation: this fraction of the train identities is held out (seeded). For each one,
