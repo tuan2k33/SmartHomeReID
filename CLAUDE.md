@@ -4,7 +4,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## State of the repo
 
-- The folder is named `truck-tarp-detection` and the README says "detect whether a truck is covered by a tarp", but the code in it is a **pet Re-ID** pipeline (DINOv3 ViT-B/16 backbone, DogFaceNet dataset). No truck or tarp code exists yet. Ask which one the user wants before extending it.
 - The three `.py` files were pasted into `README.md` and split out; the training code has never been run here (no GPU data or model on this machine). Only the metric in `eval_utils.py` has a test; there is no linter config and no build step.
 - The code refers to `vpet.md`, `petreid.md` and `split_dataset.py`; none of these exist in this repo.
 - Python deps: `torch`, `torchvision`, `transformers`, `pillow`, `numpy`. The shared base env (`~/.dev/venv`) has only numpy and pillow among these, so install the rest into this project's venv: `uv pip install --python .venv/bin/python torch torchvision transformers` (see `/mnt/c/Dev/.claude/CLAUDE.md` for venv rules).
